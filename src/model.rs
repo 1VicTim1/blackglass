@@ -44,6 +44,13 @@ pub struct Finding {
     pub weight: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Observation {
+    pub label: String,
+    pub value: String,
+    pub origin: Origin,
+}
+
 impl Finding {
     pub fn new(
         rule_id: &str,

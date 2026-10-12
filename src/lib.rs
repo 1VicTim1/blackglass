@@ -1,5 +1,8 @@
+pub mod analyzers;
 pub mod model;
 pub mod progress;
 pub mod risk;
+pub mod scan;
+pub mod tui;
 
-pub use model::{CheckState, Confidence, Finding, JobPhase, Origin, Severity};
+pub use model::{CheckState, Confidence, Finding, JobPhase, Observation, Origin, Severity};
