@@ -209,7 +209,7 @@ fn a_check_is_visible_as_running_before_it_completes() {
 }
 
 #[test]
-fn unavailable_online_adapters_are_skipped_not_reported_successful() {
+fn online_adapters_execute_or_report_a_real_failure() {
     let mut session = ScanSession::new("https://example.com").unwrap();
     while session.run_next_offline() {}
     session.request_online_consent().unwrap();
@@ -231,7 +231,13 @@ fn unavailable_online_adapters_are_skipped_not_reported_successful() {
         .iter()
         .find(|step| step.id == "network")
         .unwrap();
-    assert_eq!(network.status, StepStatus::Skipped);
-    assert_eq!(tls.status, StepStatus::Skipped);
-    assert_eq!(http.status, StepStatus::Skipped);
+    for step in [network, tls, http] {
+        assert!(
+            matches!(step.status, StepStatus::Completed | StepStatus::Failed),
+            "{} was not executed: {}",
+            step.id,
+            step.detail
+        );
+        assert!(!step.detail.to_ascii_lowercase().contains("not implemented"));
+    }
 }

@@ -59,7 +59,7 @@ pub fn lookup_government_zone(host: &str) -> Option<GovernmentZone> {
         .next()
 }
 
-fn external_data(name: &str) -> Option<String> {
+pub(crate) fn external_data(name: &str) -> Option<String> {
     let executable = env::current_exe().ok()?;
     let candidates = [
         executable.parent()?.join("data").join(name),

@@ -31,6 +31,12 @@ Offline identity checks detect brand lookalikes (including `rnicrosoft`), common
 
 Email addresses are accepted directly, for example `nulltrace 122aaa121@gmail.com`. Offline checks validate and normalize the address, inspect its local part and reuse domain impersonation rules. After explicit online consent, NULLTRACE queries MX, SPF and DMARC through Cloudflare DNS-over-HTTPS. These records describe the domain and cannot prove that an individual mailbox exists; NULLTRACE does not send mail or perform hidden SMTP recipient probes. Quoted local parts and SMTPUTF8 local parts are intentionally outside the first parser version.
 
+URL online enrichment resolves addresses, checks the embedded and local `data/hosting_prefixes.csv` CIDR catalog, queries RIPE Stat for prefix/ASN/holder and approximate GeoLite location, inspects the verified TLS certificate, and traces up to 10 HTTP redirects without downloading response bodies. HTTPS downgrade and redirects to another registrable domain become explained findings.
+
+The packaged CIDR snapshot is generated from the official Cloudflare, AWS and Google Cloud feeds. Regenerate it with `python3 scripts/update-network-data.py`; review and commit the resulting dated CSV. Provider attribution does not increase risk by itself.
+
+Optional MaxMind/DB-IP databases can be placed in `data/` beside the binary or in `NULLTRACE_DATA_DIR`. Recognized names are `GeoLite2-ASN.mmdb`, `GeoLite2-City.mmdb`, `GeoIP2-ASN.mmdb`, `GeoIP2-City.mmdb`, `DBIP-ASN-LITE.mmdb`, and `DBIP-CITY-LITE.mmdb`. Local results and RIPE results are shown with separate source labels; GeoIP describes an approximate network location, not a person's physical location.
+
 All local files receive filename and active-content inspection: bidirectional/invisible controls, deceptive double extensions, MZ/PE/ELF headers and shebangs. Files are never executed. PE/ELF and executable extensions alone are low-weight signals; filename deception and signature mismatch are stronger signals. Names display control characters as `<U+XXXX>`.
 
 MP4/MOV/M4V containers have a bounded built-in ISO BMFF parser for brands, box offsets/sizes, duration, track dimensions, sample codecs and edit lists. This works without ffprobe; optional ffprobe adds stream detail (`pkg install ffmpeg` in Termux). Cropping and re-encoding cannot be established from container metadata alone. Local reports have no DNS tasks or network consent prompt. A zero heuristic score does not establish safety; coverage and unavailable checks appear in the report.

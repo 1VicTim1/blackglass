@@ -13,3 +13,6 @@ pub mod identity;
 
 pub mod email;
 pub mod files;
+pub mod network;
+pub mod tls;
+pub mod web;

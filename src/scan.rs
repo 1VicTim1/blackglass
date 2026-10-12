@@ -52,6 +52,7 @@ pub struct ScanSession {
     findings: Vec<Finding>,
     observations: Vec<Observation>,
     events: Vec<String>,
+    resolved_ips: Vec<IpAddr>,
     consent: bool,
     active_step: Option<usize>,
 }
@@ -160,6 +161,7 @@ impl ScanSession {
             findings: vec![],
             observations: vec![],
             events: vec![format!("[*] Target acquired: {input}")],
+            resolved_ips: vec![],
             consent: false,
             active_step: None,
         })
@@ -265,8 +267,7 @@ impl ScanSession {
     fn run_step(&mut self, index: usize) {
         let started = Instant::now();
         let id = self.steps[index].id.clone();
-        let predefined_skip = matches!(id.as_str(), "network" | "tls" | "http")
-            || (self.steps[index].online && matches!(&self.target, Target::File(_)));
+        let predefined_skip = self.steps[index].online && matches!(&self.target, Target::File(_));
         let result = match (&self.target, id.as_str()) {
             (Target::Url(url), "parse") => {
                 self.observations
@@ -439,13 +440,9 @@ impl ScanSession {
                 let domain = address.domain().to_string();
                 self.inspect_email_policy(&domain, true)
             }
-            (_, "network") => Ok("No sourced ASN / country prefix dataset available".into()),
-            (Target::Url(_), "tls") => {
-                Ok("TLS adapter reserved; no unsupported claim emitted".into())
-            }
-            (Target::Url(_), "http") => {
-                Ok("HTTP adapter reserved; no unsupported claim emitted".into())
-            }
+            (Target::Url(_), "network") => self.enrich_network(),
+            (Target::Url(url), "tls") => self.inspect_tls(url.clone()),
+            (Target::Url(url), "http") => self.trace_http(url.clone()),
             (Target::File(_), _) => Ok("Not applicable to local file".into()),
             _ => Ok("Check completed".into()),
         };
@@ -664,6 +661,7 @@ impl ScanSession {
             .context("DNS resolution timed out")??;
         addresses.sort();
         addresses.dedup();
+        self.resolved_ips = addresses.clone();
         for ip in &addresses {
             self.findings
                 .extend(crate::analyzers::ip_findings(*ip, Origin::Online));
@@ -674,6 +672,201 @@ impl ScanSession {
             ));
         }
         Ok(format!("Resolved {} address(es)", addresses.len()))
+    }
+
+    fn enrich_network(&mut self) -> Result<String> {
+        let addresses: Vec<_> = self.resolved_ips.iter().copied().take(4).collect();
+        if addresses.is_empty() {
+            return Err(anyhow!("no resolved IP addresses available for enrichment"));
+        }
+        for address in &addresses {
+            let mmdb_files = crate::network::discover_mmdb_files();
+            if !mmdb_files.is_empty() {
+                match crate::network::lookup_local_mmdb(*address, &mmdb_files) {
+                    Ok(local) => {
+                        if let Some(asn) = local.asn {
+                            self.observations.push(obs(
+                                "Local MMDB ASN",
+                                format!("AS{asn}"),
+                                Origin::Online,
+                            ));
+                        }
+                        if let Some(organization) = local.organization {
+                            self.observations.push(obs(
+                                "Local MMDB organization",
+                                organization,
+                                Origin::Online,
+                            ));
+                        }
+                        if let Some(country) = local.country {
+                            self.observations.push(obs(
+                                "Local MMDB country",
+                                country,
+                                Origin::Online,
+                            ));
+                        }
+                        if let Some(city) = local.city {
+                            self.observations
+                                .push(obs("Local MMDB city", city, Origin::Online));
+                        }
+                        if !local.sources.is_empty() {
+                            self.observations.push(obs(
+                                "Local MMDB sources",
+                                local.sources.join(", "),
+                                Origin::Online,
+                            ));
+                        }
+                    }
+                    Err(error) => self.observations.push(obs(
+                        "Local MMDB error",
+                        error.to_string(),
+                        Origin::Online,
+                    )),
+                }
+            }
+            if let Some(hosting) = crate::network::lookup_hosting(*address) {
+                self.observations.push(obs(
+                    "Hosting CIDR",
+                    format!(
+                        "{} in {} ({})",
+                        hosting.provider, hosting.cidr, hosting.source
+                    ),
+                    Origin::Online,
+                ));
+            }
+            if classify_ip(*address) != "public" {
+                self.observations.push(obs(
+                    "Network enrichment",
+                    format!("{address}: skipped for {} address", classify_ip(*address)),
+                    Origin::Online,
+                ));
+                continue;
+            }
+            let intelligence = crate::network::enrich_ip(*address)?;
+            self.observations
+                .push(obs("Network address", address.to_string(), Origin::Online));
+            if let Some(prefix) = intelligence.prefix {
+                self.observations
+                    .push(obs("Network prefix", prefix, Origin::Online));
+            }
+            if !intelligence.asns.is_empty() {
+                self.observations.push(obs(
+                    "ASN",
+                    intelligence
+                        .asns
+                        .iter()
+                        .map(|asn| format!("AS{asn}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Origin::Online,
+                ));
+            }
+            if let Some(holder) = intelligence.holder {
+                self.observations
+                    .push(obs("Network holder", holder, Origin::Online));
+            }
+            if let Some(country) = intelligence.country {
+                self.observations.push(obs(
+                    intelligence
+                        .country_basis
+                        .as_deref()
+                        .unwrap_or("Network country"),
+                    country,
+                    Origin::Online,
+                ));
+            }
+            if let Some(city) = intelligence.city {
+                self.observations
+                    .push(obs("Approximate network city", city, Origin::Online));
+            }
+            self.observations.push(obs(
+                "Network data source",
+                intelligence.source,
+                Origin::Online,
+            ));
+        }
+        if self.resolved_ips.len() > addresses.len() {
+            self.observations.push(obs(
+                "Network enrichment limit",
+                format!(
+                    "inspected {} of {} resolved addresses",
+                    addresses.len(),
+                    self.resolved_ips.len()
+                ),
+                Origin::Online,
+            ));
+        }
+        Ok(format!("Enriched {} network address(es)", addresses.len()))
+    }
+
+    fn inspect_tls(&mut self, url: Url) -> Result<String> {
+        if url.scheme() != "https" {
+            return Ok("SKIPPED: TLS is not applicable to a non-HTTPS URL".into());
+        }
+        let host = url.host_str().context("URL has no TLS host")?;
+        let port = url.port_or_known_default().unwrap_or(443);
+        let report = crate::tls::inspect_tls(host.trim_matches(['[', ']']), port)?;
+        self.observations
+            .push(obs("TLS subject", report.subject, Origin::Online));
+        self.observations
+            .push(obs("TLS issuer", report.issuer, Origin::Online));
+        self.observations.push(obs(
+            "TLS validity",
+            format!("{} → {}", report.not_before, report.not_after),
+            Origin::Online,
+        ));
+        self.observations
+            .push(obs("TLS protocol", report.protocol, Origin::Online));
+        self.observations
+            .push(obs("TLS cipher", report.cipher, Origin::Online));
+        self.observations
+            .push(obs("TLS serial", report.serial, Origin::Online));
+        self.observations.push(obs(
+            "TLS chain length",
+            report.chain_length.to_string(),
+            Origin::Online,
+        ));
+        if !report.dns_names.is_empty() {
+            self.observations
+                .push(obs("TLS SAN", report.dns_names.join(", "), Origin::Online));
+        }
+        Ok("TLS certificate and negotiated session inspected".into())
+    }
+
+    fn trace_http(&mut self, url: Url) -> Result<String> {
+        let report = crate::web::trace_http(&url)?;
+        for (index, hop) in report.hops.iter().enumerate() {
+            self.observations.push(obs(
+                &format!("HTTP hop {index}"),
+                format!("{} {}", hop.status.as_u16(), hop.url),
+                Origin::Online,
+            ));
+            if let Some(location) = &hop.location {
+                self.observations
+                    .push(obs("HTTP Location", location, Origin::Online));
+            }
+            if let Some(content_type) = &hop.content_type {
+                self.observations
+                    .push(obs("HTTP Content-Type", content_type, Origin::Online));
+            }
+            if let Some(content_length) = &hop.content_length {
+                self.observations
+                    .push(obs("HTTP Content-Length", content_length, Origin::Online));
+            }
+            if let Some(server) = &hop.server {
+                self.observations
+                    .push(obs("HTTP Server", server, Origin::Online));
+            }
+        }
+        self.findings.extend(report.findings);
+        let final_url = report
+            .hops
+            .last()
+            .map(|hop| hop.url.as_str())
+            .unwrap_or(url.as_str());
+        self.observations
+            .push(obs("HTTP final URL", final_url, Origin::Online));
+        Ok(format!("Traced {} HTTP hop(s)", report.hops.len()))
     }
 
     fn inspect_email_mx(&mut self, address: EmailAddress) -> Result<String> {
