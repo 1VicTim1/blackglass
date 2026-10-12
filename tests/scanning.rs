@@ -70,6 +70,12 @@ fn file_scan_hashes_content_and_detects_extension_mismatch() {
             .iter()
             .any(|f| f.rule_id == "FILE-EXTENSION")
     );
+    for label in ["Filename", "Modified", "Read-only"] {
+        assert!(
+            session.observations().iter().any(|o| o.label == label),
+            "missing {label}"
+        );
+    }
 }
 
 #[test]
@@ -142,6 +148,55 @@ fn known_government_domain_is_reported_as_attribution_not_risk() {
             .any(|o| o.label == "Government reference")
     );
     assert!(!session.findings().iter().any(|f| f.rule_id == "GOV-DOMAIN"));
+}
+
+#[test]
+fn government_only_zone_is_attributed_without_suppressing_checks() {
+    let mut session = ScanSession::new("https://service.gov.ru/").unwrap();
+    while session.run_next_offline() {}
+    assert!(
+        session
+            .observations()
+            .iter()
+            .any(|o| o.label == "Government zone" && o.value.contains("gov.ru"))
+    );
+}
+
+#[test]
+fn additional_url_rules_flag_transport_shorteners_downloads_and_depth() {
+    let cases = [
+        ("http://bit.ly/file", "URL-PLAINTEXT"),
+        ("https://bit.ly/file", "URL-SHORTENER"),
+        ("https://example.com/invoice.exe", "URL-DOWNLOAD"),
+        ("https://a.b.c.d.e.example.com/login", "URL-SUBDOMAIN-DEPTH"),
+        ("https://example.com:8443/login", "URL-PORT"),
+    ];
+    for (url, rule) in cases {
+        let mut session = ScanSession::new(url).unwrap();
+        while session.run_next_offline() {}
+        assert!(
+            session.findings().iter().any(|f| f.rule_id == rule),
+            "missing {rule} for {url}"
+        );
+    }
+}
+
+#[test]
+fn url_structure_emits_useful_report_statistics() {
+    let mut session = ScanSession::new("https://example.com:8443/a/b?x=1&next=2").unwrap();
+    while session.run_next_offline() {}
+    for label in [
+        "Scheme",
+        "Explicit port",
+        "Path",
+        "Query parameters",
+        "Host labels",
+    ] {
+        assert!(
+            session.observations().iter().any(|o| o.label == label),
+            "missing {label}"
+        );
+    }
 }
 
 #[test]

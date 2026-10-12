@@ -6,8 +6,8 @@ use std::{
     fs::File,
     io::{BufReader, Read},
     net::{IpAddr, ToSocketAddrs},
-    path::PathBuf,
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use url::Url;
 
@@ -82,6 +82,25 @@ impl ScanSession {
                 offline("metadata", "Inspect local metadata"),
             ],
         };
+        if let Target::File(path) = &target {
+            let extension = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+                steps.push(offline(
+                    "image_structure",
+                    "Inspect image structure / encoding",
+                ));
+            }
+            if matches!(
+                extension.as_str(),
+                "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "ts"
+            ) {
+                steps.push(offline("video_probe", "Probe video container / streams"));
+            }
+        }
         steps.extend([
             online("dns", "Resolve DNS records"),
             online("network", "Attribute IP / ASN / country"),
@@ -195,12 +214,35 @@ impl ScanSession {
     fn run_step(&mut self, index: usize) {
         let started = Instant::now();
         let id = self.steps[index].id.clone();
-        let skipped = matches!(id.as_str(), "network" | "tls" | "http")
+        let predefined_skip = matches!(id.as_str(), "network" | "tls" | "http")
             || (self.steps[index].online && matches!(&self.target, Target::File(_)));
         let result = match (&self.target, id.as_str()) {
             (Target::Url(url), "parse") => {
                 self.observations
                     .push(obs("Normalized URL", url.as_str(), Origin::Offline));
+                self.observations
+                    .push(obs("Scheme", url.scheme(), Origin::Offline));
+                if let Some(port) = url.port() {
+                    self.observations
+                        .push(obs("Explicit port", port.to_string(), Origin::Offline));
+                }
+                self.observations.push(obs(
+                    "Path",
+                    format!("{} ({} chars)", url.path(), url.path().chars().count()),
+                    Origin::Offline,
+                ));
+                self.observations.push(obs(
+                    "Query parameters",
+                    url.query_pairs().count().to_string(),
+                    Origin::Offline,
+                ));
+                if let Some(host) = url.host_str() {
+                    self.observations.push(obs(
+                        "Host labels",
+                        host.split('.').count().to_string(),
+                        Origin::Offline,
+                    ));
+                }
                 Ok("URL parsed".into())
             }
             (Target::Url(url), "identity") => self.inspect_url_identity(url.clone()),
@@ -246,6 +288,10 @@ impl ScanSession {
                 ));
                 Ok("Local metadata recorded".into())
             }
+            (Target::File(path), "image_structure") => {
+                inspect_image_step(path, &mut self.observations)
+            }
+            (Target::File(path), "video_probe") => probe_video_step(path, &mut self.observations),
             (Target::Url(url), "dns") => self.resolve_dns(url.clone()),
             (_, "network") => Ok("No sourced ASN / country prefix dataset available".into()),
             (Target::Url(_), "tls") => {
@@ -260,6 +306,12 @@ impl ScanSession {
         self.steps[index].elapsed_ms = started.elapsed().as_millis();
         match result {
             Ok(detail) => {
+                let dynamically_skipped = detail.starts_with("SKIPPED: ");
+                let skipped = predefined_skip || dynamically_skipped;
+                let detail = detail
+                    .strip_prefix("SKIPPED: ")
+                    .unwrap_or(&detail)
+                    .to_string();
                 self.steps[index].status = if skipped {
                     StepStatus::Skipped
                 } else {
@@ -277,6 +329,33 @@ impl ScanSession {
         }
     }
     fn inspect_url_identity(&mut self, url: Url) -> Result<String> {
+        if url.scheme() == "http" {
+            self.findings.push(Finding::new(
+                "URL-PLAINTEXT",
+                "transport",
+                Origin::Offline,
+                Severity::Medium,
+                Confidence::High,
+                "URL uses unencrypted HTTP",
+                18,
+            ));
+        }
+        if let Some(port) = url.port()
+            && !matches!((url.scheme(), port), ("http", 80) | ("https", 443))
+        {
+            self.findings.push(
+                Finding::new(
+                    "URL-PORT",
+                    "transport",
+                    Origin::Offline,
+                    Severity::Low,
+                    Confidence::High,
+                    "URL uses a non-standard port",
+                    10,
+                )
+                .with_evidence(port.to_string()),
+            );
+        }
         if !url.username().is_empty() {
             self.findings.push(
                 Finding::new(
@@ -304,6 +383,51 @@ impl ScanSession {
                     Origin::Offline,
                 ));
             }
+            if let Some(zone) = crate::data::lookup_government_zone(host) {
+                self.observations.push(obs(
+                    "Government zone",
+                    format!("{} — {} ({})", zone.suffix, zone.authority, zone.source),
+                    Origin::Offline,
+                ));
+            }
+            const SHORTENERS: &[&str] = &[
+                "bit.ly",
+                "t.co",
+                "tinyurl.com",
+                "goo.gl",
+                "clck.ru",
+                "vk.cc",
+                "is.gd",
+                "cutt.ly",
+            ];
+            if SHORTENERS.contains(&host) {
+                self.findings.push(
+                    Finding::new(
+                        "URL-SHORTENER",
+                        "identity",
+                        Origin::Offline,
+                        Severity::Medium,
+                        Confidence::High,
+                        "URL uses a shortening service",
+                        18,
+                    )
+                    .with_evidence(host),
+                );
+            }
+            if host.split('.').count() > 5 {
+                self.findings.push(
+                    Finding::new(
+                        "URL-SUBDOMAIN-DEPTH",
+                        "identity",
+                        Origin::Offline,
+                        Severity::Low,
+                        Confidence::Medium,
+                        "Host has unusually deep subdomain nesting",
+                        10,
+                    )
+                    .with_evidence(host),
+                );
+            }
             if host.parse::<IpAddr>().is_ok() {
                 self.findings.push(
                     Finding::new(
@@ -329,6 +453,25 @@ impl ScanSession {
                     20,
                 ));
             }
+        }
+        let path = url.path().to_ascii_lowercase();
+        const DOWNLOAD_EXTENSIONS: &[&str] = &[
+            ".exe", ".scr", ".msi", ".dll", ".apk", ".jar", ".js", ".iso", ".img", ".zip", ".rar",
+            ".7z",
+        ];
+        if let Some(extension) = DOWNLOAD_EXTENSIONS.iter().find(|ext| path.ends_with(**ext)) {
+            self.findings.push(
+                Finding::new(
+                    "URL-DOWNLOAD",
+                    "payload",
+                    Origin::Offline,
+                    Severity::Medium,
+                    Confidence::High,
+                    "URL path points to an executable or archive",
+                    22,
+                )
+                .with_evidence(*extension),
+            );
         }
         Ok("Host identity inspected".into())
     }
@@ -374,8 +517,38 @@ fn obs(label: &str, value: impl Into<String>, origin: Origin) -> Observation {
 fn fs_stat(path: PathBuf, observations: &mut Vec<Observation>) -> Result<String> {
     let meta = path.metadata()?;
     observations.push(obs(
+        "Filename",
+        path.file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("<non-UTF8>"),
+        Origin::Offline,
+    ));
+    observations.push(obs(
         "Size",
         format!("{} bytes", meta.len()),
+        Origin::Offline,
+    ));
+    if let Ok(modified) = meta.modified()
+        && let Ok(delta) = modified.duration_since(UNIX_EPOCH)
+    {
+        observations.push(obs(
+            "Modified",
+            format!("Unix {}", delta.as_secs()),
+            Origin::Offline,
+        ));
+    }
+    if let Ok(created) = meta.created()
+        && let Ok(delta) = created.duration_since(UNIX_EPOCH)
+    {
+        observations.push(obs(
+            "Created",
+            format!("Unix {}", delta.as_secs()),
+            Origin::Offline,
+        ));
+    }
+    observations.push(obs(
+        "Read-only",
+        meta.permissions().readonly().to_string(),
         Origin::Offline,
     ));
     Ok("File identity recorded".into())
@@ -437,6 +610,24 @@ fn fs_signature(
         observations.push(obs("Detected MIME", "unknown", Origin::Offline));
     }
     Ok("Content signature inspected".into())
+}
+
+fn inspect_image_step(path: &Path, observations: &mut Vec<Observation>) -> Result<String> {
+    for (label, value) in crate::media::inspect_image(path)? {
+        observations.push(obs(&label, value, Origin::Offline));
+    }
+    Ok("Image structure inspected".into())
+}
+
+fn probe_video_step(path: &Path, observations: &mut Vec<Observation>) -> Result<String> {
+    let probe = crate::media::probe_video(path, Duration::from_secs(8))?;
+    for (label, value) in probe.observations {
+        observations.push(obs(&label, value, Origin::Offline));
+    }
+    Ok(match probe.skipped {
+        Some(reason) => format!("SKIPPED: {reason}"),
+        None => "Video streams inspected".into(),
+    })
 }
 
 #[allow(dead_code)]

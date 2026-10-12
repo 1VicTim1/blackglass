@@ -102,10 +102,21 @@ pub fn render_snapshot(
     tick: usize,
     caps: TerminalCapabilities,
 ) -> String {
+    render_snapshot_scrolled(session, width, height, tick, caps, 0)
+}
+
+pub fn render_snapshot_scrolled(
+    session: &ScanSession,
+    width: u16,
+    height: u16,
+    tick: usize,
+    caps: TerminalCapabilities,
+    scroll: u16,
+) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test backend");
     terminal
-        .draw(|f| draw(f, session, tick, caps, false))
+        .draw(|f| draw_scrolled(f, session, tick, caps, false, scroll))
         .expect("draw");
     let buffer = terminal.backend().buffer();
     let mut out = String::new();
@@ -124,6 +135,17 @@ pub fn draw(
     tick: usize,
     caps: TerminalCapabilities,
     consent_modal: bool,
+) {
+    draw_scrolled(frame, session, tick, caps, consent_modal, 0)
+}
+
+fn draw_scrolled(
+    frame: &mut Frame,
+    session: &ScanSession,
+    tick: usize,
+    caps: TerminalCapabilities,
+    consent_modal: bool,
+    evidence_scroll: u16,
 ) {
     let area = frame.area();
     frame.render_widget(
@@ -159,9 +181,9 @@ pub fn draw(
     );
     frame.render_widget(logo, rows[0]);
     if area.width >= 90 {
-        draw_wide(frame, rows[1], session, tick, caps)
+        draw_wide(frame, rows[1], session, tick, caps, evidence_scroll)
     } else {
-        draw_compact(frame, rows[1], session, tick, caps)
+        draw_compact(frame, rows[1], session, tick, caps, evidence_scroll)
     }
     let complete = session.offline_complete();
     let footer = if complete && session.phase() == crate::JobPhase::OfflineComplete {
@@ -183,7 +205,14 @@ pub fn draw(
         draw_consent(frame, area, caps);
     }
 }
-fn draw_wide(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: TerminalCapabilities) {
+fn draw_wide(
+    frame: &mut Frame,
+    area: Rect,
+    s: &ScanSession,
+    tick: usize,
+    c: TerminalCapabilities,
+    scroll: u16,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
@@ -193,7 +222,7 @@ fn draw_wide(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: Ter
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(cols[1]);
-    draw_evidence(frame, right[0], s, c);
+    draw_evidence(frame, right[0], s, c, scroll);
     draw_events(frame, right[1], s, c);
 }
 fn draw_compact(
@@ -202,13 +231,14 @@ fn draw_compact(
     s: &ScanSession,
     tick: usize,
     c: TerminalCapabilities,
+    scroll: u16,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
     draw_tree(frame, rows[0], s, tick, c);
-    draw_evidence(frame, rows[1], s, c);
+    draw_evidence(frame, rows[1], s, c, scroll);
 }
 fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: TerminalCapabilities) {
     let mut items = vec![ListItem::new(Line::styled(
@@ -219,6 +249,9 @@ fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: Ter
     ))];
     for step in s.steps().iter().filter(|v| !v.online) {
         items.push(step_item(step, tick, c));
+        if !step.detail.is_empty() {
+            items.push(step_detail_item(step));
+        }
     }
     let online_title =
         if s.phase() == crate::JobPhase::OnlineRunning || s.phase() == crate::JobPhase::Complete {
@@ -234,6 +267,9 @@ fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: Ter
     )));
     for step in s.steps().iter().filter(|v| v.online) {
         items.push(step_item(step, tick, c));
+        if !step.detail.is_empty() {
+            items.push(step_detail_item(step));
+        }
     }
     let settled = s
         .steps()
@@ -281,7 +317,19 @@ fn step_item(step: &ScanStep, tick: usize, c: TerminalCapabilities) -> ListItem<
         Span::raw(format!(" {}{}", step.label, duration)),
     ]))
 }
-fn draw_evidence(frame: &mut Frame, area: Rect, s: &ScanSession, c: TerminalCapabilities) {
+fn step_detail_item(step: &ScanStep) -> ListItem<'static> {
+    ListItem::new(Line::styled(
+        format!("      └─ {}", step.detail),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+fn draw_evidence(
+    frame: &mut Frame,
+    area: Rect,
+    s: &ScanSession,
+    c: TerminalCapabilities,
+    scroll: u16,
+) {
     let summary = risk::summarize(s.findings());
     let mut lines = vec![
         Line::from(vec![
@@ -310,7 +358,10 @@ fn draw_evidence(frame: &mut Frame, area: Rect, s: &ScanSession, c: TerminalCapa
         };
         lines.push(Line::from(vec![
             Span::styled(m, Style::default().fg(Color::Yellow)),
-            Span::raw(format!(" {}  {}", f.rule_id, f.summary)),
+            Span::raw(format!(
+                " {} [{:?}/{:?} +{}]  {}",
+                f.rule_id, f.severity, f.confidence, f.weight, f.summary
+            )),
         ]));
         for ev in &f.evidence {
             lines.push(Line::styled(
@@ -332,12 +383,15 @@ fn draw_evidence(frame: &mut Frame, area: Rect, s: &ScanSession, c: TerminalCapa
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" EVIDENCE TREE ")
-                .border_style(Style::default().fg(rgb(c, 255, 0, 170, Color::Magenta))),
-        ),
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" EVIDENCE TREE ")
+                    .border_style(Style::default().fg(rgb(c, 255, 0, 170, Color::Magenta))),
+            ),
         area,
     );
 }
@@ -464,9 +518,10 @@ where
     let started = Instant::now();
     let mut last = Instant::now();
     let mut consent = false;
+    let mut evidence_scroll = 0u16;
     loop {
         let tick = (started.elapsed().as_millis() / 140) as usize;
-        terminal.draw(|f| draw(f, session, tick, caps, consent))?;
+        terminal.draw(|f| draw_scrolled(f, session, tick, caps, consent, evidence_scroll))?;
         if last.elapsed() >= Duration::from_millis(420) {
             if session.phase() == crate::JobPhase::OfflineRunning {
                 session.run_next_offline();
@@ -493,6 +548,8 @@ where
                     session.cancel_online_consent()?;
                     consent = false;
                 }
+                KeyCode::Up => evidence_scroll = evidence_scroll.saturating_sub(1),
+                KeyCode::Down => evidence_scroll = evidence_scroll.saturating_add(1),
                 _ => {}
             }
         }

@@ -13,6 +13,8 @@ The offline report completes first. Press Enter to open the network consent dial
 
 The data directory should sit beside the binary. Its government-domain list is a small sourced seed, not a complete official registry. No government CIDR is asserted without a cited source.
 
+Image scans parse PNG/JPEG/WebP dimensions, JPEG frame and quantization structure, and selected EXIF camera/software/date/GPS fields. Video scans use local `ffprobe` when installed (`pkg install ffmpeg` in Termux); otherwise the video probe is shown as skipped rather than successful. Metadata and encoder tags are evidence, not proof of editing.
+
 ## Build
 
 ```bash
