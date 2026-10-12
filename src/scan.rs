@@ -39,6 +39,7 @@ pub struct ScanStep {
 enum Target {
     Url(Url),
     Email(EmailAddress),
+    Eml(PathBuf),
     File(PathBuf),
 }
 pub struct OnlineToken(());
@@ -73,7 +74,13 @@ impl ScanSession {
         } else {
             let path = PathBuf::from(input);
             match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.file_type().is_file() => Target::File(path),
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    if crate::eml::looks_like_eml(&path) {
+                        Target::Eml(path)
+                    } else {
+                        Target::File(path)
+                    }
+                }
                 Ok(_) => return Err(anyhow!("target is neither a URL nor an existing file")),
                 Err(_) if input.contains('@') => Target::Email(EmailAddress::parse(input)?),
                 Err(_) => {
@@ -94,6 +101,18 @@ impl ScanSession {
                 offline("email_parse", "Parse & normalize email address"),
                 offline("email_local", "Inspect mailbox local part"),
                 offline("email_domain", "Inspect email domain identity"),
+            ],
+            Target::Eml(_) => vec![
+                offline("stat", "Read file identity"),
+                offline("hash", "Calculate SHA-256"),
+                offline("signature", "Detect content signature"),
+                offline("metadata", "Inspect local metadata"),
+                offline("file_safety", "Inspect filename / executable headers"),
+                offline("eml_headers", "Parse message headers / route"),
+                offline("eml_auth", "Inspect SPF / DKIM / DMARC evidence"),
+                offline("eml_bodies", "Decode MIME body parts"),
+                offline("eml_links", "Extract and compare message links"),
+                offline("eml_attachments", "Inspect MIME attachments"),
             ],
             Target::File(_) => vec![
                 offline("stat", "Read file identity"),
@@ -151,6 +170,12 @@ impl ScanSession {
                 online("email_mx", "Resolve mail exchanger records"),
                 online("email_spf", "Inspect sender policy (SPF)"),
                 online("email_dmarc", "Inspect DMARC policy"),
+            ]);
+        }
+        if matches!(&target, Target::Eml(_)) {
+            steps.extend([
+                online("eml_sender_dns", "Verify sender-domain DNS policies"),
+                online("eml_link_intel", "Trace extracted HTTP links"),
             ]);
         }
         Ok(Self {
@@ -388,12 +413,16 @@ impl ScanSession {
                 );
                 Ok("Email domain identity inspected".into())
             }
-            (Target::File(path), "stat") => fs_stat(path.clone(), &mut self.observations),
-            (Target::File(path), "hash") => fs_hash(path.clone(), &mut self.observations),
-            (Target::File(path), "signature") => {
+            (Target::File(path) | Target::Eml(path), "stat") => {
+                fs_stat(path.clone(), &mut self.observations)
+            }
+            (Target::File(path) | Target::Eml(path), "hash") => {
+                fs_hash(path.clone(), &mut self.observations)
+            }
+            (Target::File(path) | Target::Eml(path), "signature") => {
                 fs_signature(path.clone(), &mut self.observations, &mut self.findings)
             }
-            (Target::File(path), "metadata") => {
+            (Target::File(path) | Target::Eml(path), "metadata") => {
                 self.observations.push(obs(
                     "Metadata",
                     format!(
@@ -404,7 +433,7 @@ impl ScanSession {
                 ));
                 Ok("Local metadata recorded".into())
             }
-            (Target::File(path), "file_safety") => {
+            (Target::File(path) | Target::Eml(path), "file_safety") => {
                 let result = crate::files::inspect(path);
                 result.map(|(findings, details)| {
                     self.findings.extend(findings);
@@ -430,6 +459,9 @@ impl ScanSession {
                 })
             }
             (Target::File(path), "video_probe") => probe_video_step(path, &mut self.observations),
+            (Target::Eml(path), id) if id.starts_with("eml_") && !self.steps[index].online => {
+                inspect_eml_step(path, id, &mut self.observations, &mut self.findings)
+            }
             (Target::Url(url), "dns") => self.resolve_dns(url.clone()),
             (Target::Email(address), "email_mx") => self.inspect_email_mx(address.clone()),
             (Target::Email(address), "email_spf") => {
@@ -443,7 +475,10 @@ impl ScanSession {
             (Target::Url(_), "network") => self.enrich_network(),
             (Target::Url(url), "tls") => self.inspect_tls(url.clone()),
             (Target::Url(url), "http") => self.trace_http(url.clone()),
+            (Target::Eml(path), "eml_sender_dns") => self.inspect_eml_sender_dns(path.clone()),
+            (Target::Eml(path), "eml_link_intel") => self.inspect_eml_links(path.clone()),
             (Target::File(_), _) => Ok("Not applicable to local file".into()),
+            (Target::Eml(_), _) => Ok("Message check completed".into()),
             _ => Ok("Check completed".into()),
         };
         self.steps[index].elapsed_ms = started.elapsed().as_millis();
@@ -869,6 +904,102 @@ impl ScanSession {
         Ok(format!("Traced {} HTTP hop(s)", report.hops.len()))
     }
 
+    fn inspect_eml_sender_dns(&mut self, path: PathBuf) -> Result<String> {
+        let report = crate::eml::inspect(&path)?;
+        let domain = report
+            .sender_domain
+            .context("message has no parseable From domain")?;
+        self.observations
+            .push(obs("Sender DNS domain", &domain, Origin::Online));
+        match crate::email::lookup_mx(&domain)? {
+            MailDnsResult::MailExchangers(records) => {
+                for record in records {
+                    self.observations
+                        .push(obs("Sender MX", record, Origin::Online));
+                }
+            }
+            MailDnsResult::AddressFallback(addresses) => {
+                self.observations.push(obs(
+                    "Sender mail route",
+                    format!("A/AAAA fallback: {}", addresses.join(", ")),
+                    Origin::Online,
+                ));
+            }
+            MailDnsResult::NoMailRoute => {
+                self.observations.push(obs(
+                    "Sender mail route",
+                    "no MX or A/AAAA fallback",
+                    Origin::Online,
+                ));
+                self.findings.push(Finding::new(
+                    "EML-SENDER-NO-MAIL-ROUTE",
+                    "message-infrastructure",
+                    Origin::Online,
+                    Severity::Medium,
+                    Confidence::High,
+                    "Visible sender domain has no discoverable mail route",
+                    18,
+                ));
+            }
+            MailDnsResult::Policy(_) => unreachable!("MX lookup cannot return a policy"),
+        }
+        for (name, query, prefix) in [
+            ("Live sender SPF", domain.clone(), "v=spf1"),
+            ("Live sender DMARC", format!("_dmarc.{domain}"), "v=DMARC1"),
+        ] {
+            let MailDnsResult::Policy(policy) = crate::email::lookup_policy(&query, prefix)? else {
+                unreachable!("policy lookup cannot return mail routes");
+            };
+            let value = match policy {
+                PolicyState::Present(value) => value,
+                PolicyState::Missing => "not published".into(),
+                PolicyState::Multiple(count) => format!("{count} conflicting records"),
+            };
+            self.observations.push(obs(name, value, Origin::Online));
+        }
+        Ok(format!("Verified DNS mail policy for {domain}"))
+    }
+
+    fn inspect_eml_links(&mut self, path: PathBuf) -> Result<String> {
+        let report = crate::eml::inspect(&path)?;
+        let total = report.urls.len();
+        let inspected = total.min(5);
+        let traces = crate::eml::inspect_urls_independently(&report.urls, 5, |url| {
+            crate::web::trace_http(url)
+        });
+        let mut succeeded = 0;
+        for (url, result) in traces {
+            match result {
+                Ok(trace) => {
+                    succeeded += 1;
+                    for (index, hop) in trace.hops.iter().enumerate() {
+                        self.observations.push(obs(
+                            "Message HTTP hop",
+                            format!("{}: {} {}", index + 1, hop.status.as_u16(), hop.url),
+                            Origin::Online,
+                        ));
+                    }
+                    self.findings.extend(trace.findings);
+                }
+                Err(error) => self.observations.push(obs(
+                    "Message link error",
+                    format!("{url}: {error}"),
+                    Origin::Online,
+                )),
+            }
+        }
+        if total > inspected {
+            self.observations.push(obs(
+                "Message link limit",
+                format!("traced {inspected} of {total} unique URLs"),
+                Origin::Online,
+            ));
+        }
+        Ok(format!(
+            "Traced {succeeded}/{inspected} extracted HTTP link(s)"
+        ))
+    }
+
     fn inspect_email_mx(&mut self, address: EmailAddress) -> Result<String> {
         match crate::email::lookup_mx(address.domain())? {
             MailDnsResult::MailExchangers(records) => {
@@ -979,6 +1110,34 @@ impl ScanSession {
             }
         }
     }
+}
+
+fn inspect_eml_step(
+    path: &Path,
+    id: &str,
+    observations: &mut Vec<Observation>,
+    findings: &mut Vec<Finding>,
+) -> Result<String> {
+    let report = crate::eml::inspect(path)?;
+    let (section, detail) = match id {
+        "eml_headers" => (report.headers, "Message headers and Received route parsed"),
+        "eml_auth" => (
+            report.authentication,
+            "Authentication-Results, DKIM and ARC evidence inspected",
+        ),
+        "eml_bodies" => (report.bodies, "MIME text bodies decoded"),
+        "eml_links" => (report.links, "Message links extracted and compared"),
+        "eml_attachments" => (report.attachments, "MIME attachments inspected"),
+        _ => return Err(anyhow!("unknown EML analysis step: {id}")),
+    };
+    observations.extend(
+        section
+            .observations
+            .into_iter()
+            .map(|(label, value)| obs(&label, value, Origin::Offline)),
+    );
+    findings.extend(section.findings);
+    Ok(detail.into())
 }
 
 fn offline(id: &str, label: &str) -> ScanStep {

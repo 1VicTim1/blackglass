@@ -12,6 +12,7 @@ pub use model::{CheckState, Confidence, Finding, JobPhase, Observation, Origin, 
 pub mod identity;
 
 pub mod email;
+pub mod eml;
 pub mod files;
 pub mod network;
 pub mod tls;
