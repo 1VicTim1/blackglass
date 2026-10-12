@@ -1,0 +1,20 @@
+[package]
+name = "nulltrace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "nulltrace"
+path = "src/main.rs"
