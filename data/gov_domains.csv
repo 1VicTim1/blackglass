@@ -1,0 +1,7 @@
+# schema=1,retrieved=2026-10-12
+domain,subdomains,authority,source
+government.ru,true,Government of the Russian Federation,http://government.ru/
+kremlin.ru,true,President of Russia,http://kremlin.ru/
+council.gov.ru,true,Federation Council,http://council.gov.ru/
+duma.gov.ru,true,State Duma,http://duma.gov.ru/
+nalog.gov.ru,true,Federal Tax Service,https://www.nalog.gov.ru/

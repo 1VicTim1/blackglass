@@ -1,4 +1,5 @@
 pub mod analyzers;
+pub mod data;
 pub mod model;
 pub mod progress;
 pub mod risk;

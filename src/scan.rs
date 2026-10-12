@@ -46,6 +46,7 @@ pub struct ScanSession {
     observations: Vec<Observation>,
     events: Vec<String>,
     consent: bool,
+    active_step: Option<usize>,
 }
 
 impl ScanSession {
@@ -88,6 +89,7 @@ impl ScanSession {
             observations: vec![],
             events: vec![format!("[*] Target acquired: {input}")],
             consent: false,
+            active_step: None,
         })
     }
     pub fn target(&self) -> &str {
@@ -115,18 +117,33 @@ impl ScanSession {
             || self.phase == JobPhase::Complete
     }
     pub fn run_next_offline(&mut self) -> bool {
+        self.advance(false)
+    }
+    fn advance(&mut self, online: bool) -> bool {
+        if let Some(index) = self.active_step
+            && self.steps[index].online == online
+        {
+            self.run_step(index);
+            self.active_step = None;
+            return true;
+        }
         let Some(index) = self
             .steps
             .iter()
-            .position(|s| !s.online && s.status == StepStatus::Queued)
+            .position(|s| s.online == online && s.status == StepStatus::Queued)
         else {
-            if self.phase == JobPhase::OfflineRunning {
+            if !online && self.phase == JobPhase::OfflineRunning {
                 self.phase = JobPhase::OfflineComplete;
                 self.events.push("[+] Offline analysis complete".into());
+            } else if online && self.phase == JobPhase::OnlineRunning {
+                self.phase = JobPhase::Complete;
+                self.events.push("[+] Online enrichment complete".into());
             }
             return false;
         };
-        self.run_step(index);
+        self.steps[index].status = StepStatus::Running;
+        self.events.push(format!("[*] {}", self.steps[index].label));
+        self.active_step = Some(index);
         true
     }
     pub fn request_online_consent(&mut self) -> Result<()> {
@@ -157,25 +174,13 @@ impl ScanSession {
         Ok(())
     }
     pub fn run_next_online(&mut self) -> bool {
-        let Some(index) = self
-            .steps
-            .iter()
-            .position(|s| s.online && s.status == StepStatus::Queued)
-        else {
-            if self.phase == JobPhase::OnlineRunning {
-                self.phase = JobPhase::Complete;
-                self.events.push("[+] Online enrichment complete".into());
-            }
-            return false;
-        };
-        self.run_step(index);
-        true
+        self.advance(true)
     }
     fn run_step(&mut self, index: usize) {
-        self.steps[index].status = StepStatus::Running;
         let started = Instant::now();
-        self.events.push(format!("[*] {}", self.steps[index].label));
         let id = self.steps[index].id.clone();
+        let skipped = matches!(id.as_str(), "tls" | "http")
+            || (self.steps[index].online && matches!(&self.target, Target::File(_)));
         let result = match (&self.target, id.as_str()) {
             (Target::Url(url), "parse") => {
                 self.observations
@@ -239,9 +244,14 @@ impl ScanSession {
         self.steps[index].elapsed_ms = started.elapsed().as_millis();
         match result {
             Ok(detail) => {
-                self.steps[index].status = StepStatus::Completed;
+                self.steps[index].status = if skipped {
+                    StepStatus::Skipped
+                } else {
+                    StepStatus::Completed
+                };
                 self.steps[index].detail = detail.clone();
-                self.events.push(format!("[+] {detail}"));
+                self.events
+                    .push(format!("{} {detail}", if skipped { "[?]" } else { "[+]" }));
             }
             Err(error) => {
                 self.steps[index].status = StepStatus::Failed;
@@ -267,6 +277,16 @@ impl ScanSession {
         }
         if let Some(host) = url.host_str() {
             self.observations.push(obs("Host", host, Origin::Offline));
+            if let Some(reference) = crate::data::lookup_government_host(host) {
+                self.observations.push(obs(
+                    "Government reference",
+                    format!(
+                        "{} — {} ({})",
+                        reference.domain, reference.authority, reference.source
+                    ),
+                    Origin::Offline,
+                ));
+            }
             if host.parse::<IpAddr>().is_ok() {
                 self.findings.push(
                     Finding::new(
