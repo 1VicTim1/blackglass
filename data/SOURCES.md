@@ -7,3 +7,5 @@
 `gov_zones.csv` contains restricted government namespaces. A suffix match is displayed as namespace attribution, not proof that the specific content is authentic or uncompromised.
 
 `brands.csv` is a manually curated subset of official brand domains with home-page sources. It is incomplete and must not be used as an allowlist or certificate/ownership verification. Similarity rules are offline heuristics.
+
+Email MX, SPF and DMARC enrichment uses Cloudflare's documented DNS-over-HTTPS JSON endpoint only after user consent: https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/

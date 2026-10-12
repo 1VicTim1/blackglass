@@ -1,4 +1,8 @@
-use crate::{Confidence, Finding, JobPhase, Observation, Origin, Severity, analyzers::classify_ip};
+use crate::{
+    Confidence, Finding, JobPhase, Observation, Origin, Severity,
+    analyzers::classify_ip,
+    email::{EmailAddress, MailDnsResult, PolicyState},
+};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +38,7 @@ pub struct ScanStep {
 #[derive(Clone)]
 enum Target {
     Url(Url),
+    Email(EmailAddress),
     File(PathBuf),
 }
 pub struct OnlineToken(());
@@ -66,12 +71,16 @@ impl ScanSession {
             Target::Url(url)
         } else {
             let path = PathBuf::from(input);
-            let metadata = std::fs::symlink_metadata(&path)
-                .map_err(|_| anyhow!("target is neither a URL nor a readable regular file"))?;
-            if !metadata.file_type().is_file() {
-                return Err(anyhow!("target is neither a URL nor an existing path"));
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => Target::File(path),
+                Ok(_) => return Err(anyhow!("target is neither a URL nor an existing file")),
+                Err(_) if input.contains('@') => Target::Email(EmailAddress::parse(input)?),
+                Err(_) => {
+                    return Err(anyhow!(
+                        "target is neither a URL, email address nor a readable regular file"
+                    ));
+                }
             }
-            Target::File(path)
         };
         let mut steps = match &target {
             Target::Url(_) => vec![
@@ -79,6 +88,11 @@ impl ScanSession {
                 offline("identity", "Inspect host identity"),
                 offline("encoding", "Decode URL structure"),
                 offline("ip", "Classify literal address"),
+            ],
+            Target::Email(_) => vec![
+                offline("email_parse", "Parse & normalize email address"),
+                offline("email_local", "Inspect mailbox local part"),
+                offline("email_domain", "Inspect email domain identity"),
             ],
             Target::File(_) => vec![
                 offline("stat", "Read file identity"),
@@ -129,6 +143,13 @@ impl ScanSession {
                 online("network", "Attribute IP / ASN / country"),
                 online("tls", "Inspect TLS identity"),
                 online("http", "Trace HTTP redirects"),
+            ]);
+        }
+        if matches!(&target, Target::Email(_)) {
+            steps.extend([
+                online("email_mx", "Resolve mail exchanger records"),
+                online("email_spf", "Inspect sender policy (SPF)"),
+                online("email_dmarc", "Inspect DMARC policy"),
             ]);
         }
         Ok(Self {
@@ -309,6 +330,63 @@ impl ScanSession {
                 }
                 Ok("Address scope classified".into())
             }
+            (Target::Email(address), "email_parse") => {
+                self.observations
+                    .push(obs("Email address", address.normalized(), Origin::Offline));
+                self.observations
+                    .push(obs("Email local part", address.local(), Origin::Offline));
+                self.observations
+                    .push(obs("Email domain", address.domain(), Origin::Offline));
+                self.observations.push(obs(
+                    "Mailbox existence",
+                    "not probed; MX/SPF/DMARC cannot prove that this mailbox exists",
+                    Origin::Offline,
+                ));
+                Ok("Email syntax and IDNA domain normalized".into())
+            }
+            (Target::Email(address), "email_local") => {
+                if address.local().contains('+') {
+                    self.observations.push(obs(
+                        "Subaddressing",
+                        "plus tag present",
+                        Origin::Offline,
+                    ));
+                }
+                let mailbox = address
+                    .local()
+                    .split('+')
+                    .next()
+                    .unwrap_or(address.local())
+                    .to_ascii_lowercase();
+                if matches!(
+                    mailbox.as_str(),
+                    "admin"
+                        | "administrator"
+                        | "billing"
+                        | "help"
+                        | "info"
+                        | "noreply"
+                        | "security"
+                        | "support"
+                ) {
+                    self.observations.push(obs(
+                        "Mailbox role",
+                        format!("role-like local part: {mailbox}"),
+                        Origin::Offline,
+                    ));
+                }
+                Ok("Mailbox local part inspected".into())
+            }
+            (Target::Email(address), "email_domain") => {
+                let (findings, details) = crate::identity::inspect_domain(address.domain());
+                self.findings.extend(findings);
+                self.observations.extend(
+                    details
+                        .into_iter()
+                        .map(|(key, value)| obs(&key, value, Origin::Offline)),
+                );
+                Ok("Email domain identity inspected".into())
+            }
             (Target::File(path), "stat") => fs_stat(path.clone(), &mut self.observations),
             (Target::File(path), "hash") => fs_hash(path.clone(), &mut self.observations),
             (Target::File(path), "signature") => {
@@ -352,6 +430,15 @@ impl ScanSession {
             }
             (Target::File(path), "video_probe") => probe_video_step(path, &mut self.observations),
             (Target::Url(url), "dns") => self.resolve_dns(url.clone()),
+            (Target::Email(address), "email_mx") => self.inspect_email_mx(address.clone()),
+            (Target::Email(address), "email_spf") => {
+                let domain = address.domain().to_string();
+                self.inspect_email_policy(&domain, false)
+            }
+            (Target::Email(address), "email_dmarc") => {
+                let domain = address.domain().to_string();
+                self.inspect_email_policy(&domain, true)
+            }
             (_, "network") => Ok("No sourced ASN / country prefix dataset available".into()),
             (Target::Url(_), "tls") => {
                 Ok("TLS adapter reserved; no unsupported claim emitted".into())
@@ -587,6 +674,117 @@ impl ScanSession {
             ));
         }
         Ok(format!("Resolved {} address(es)", addresses.len()))
+    }
+
+    fn inspect_email_mx(&mut self, address: EmailAddress) -> Result<String> {
+        match crate::email::lookup_mx(address.domain())? {
+            MailDnsResult::MailExchangers(records) => {
+                for record in &records {
+                    self.observations
+                        .push(obs("Mail exchanger", record, Origin::Online));
+                }
+                Ok(format!("Resolved {} MX record(s)", records.len()))
+            }
+            MailDnsResult::AddressFallback(addresses) => {
+                for address in &addresses {
+                    self.observations.push(obs(
+                        "Mail routing fallback",
+                        format!("A/AAAA {address}"),
+                        Origin::Online,
+                    ));
+                }
+                self.findings.push(Finding::new(
+                    "EMAIL-MX-FALLBACK",
+                    "email-infrastructure",
+                    Origin::Online,
+                    Severity::Info,
+                    Confidence::High,
+                    "Domain has no MX record and relies on address fallback",
+                    3,
+                ));
+                Ok(format!(
+                    "No MX; found {} A/AAAA fallback address(es)",
+                    addresses.len()
+                ))
+            }
+            MailDnsResult::NoMailRoute => {
+                self.observations.push(obs(
+                    "Mail exchanger",
+                    "no MX or A/AAAA fallback found",
+                    Origin::Online,
+                ));
+                self.findings.push(Finding::new(
+                    "EMAIL-NO-ROUTE",
+                    "email-infrastructure",
+                    Origin::Online,
+                    Severity::High,
+                    Confidence::High,
+                    "Email domain has no discoverable mail route",
+                    35,
+                ));
+                Ok("No mail route found".into())
+            }
+            MailDnsResult::Policy(_) => Err(anyhow!("unexpected DNS result for MX lookup")),
+        }
+    }
+
+    fn inspect_email_policy(&mut self, domain: &str, dmarc: bool) -> Result<String> {
+        let (query, prefix, label, rule) = if dmarc {
+            (
+                format!("_dmarc.{domain}"),
+                "v=DMARC1",
+                "DMARC policy",
+                "EMAIL-DMARC",
+            )
+        } else {
+            (domain.to_string(), "v=spf1", "SPF policy", "EMAIL-SPF")
+        };
+        let MailDnsResult::Policy(state) = crate::email::lookup_policy(&query, prefix)? else {
+            return Err(anyhow!("unexpected DNS result for mail policy lookup"));
+        };
+        match state {
+            PolicyState::Present(policy) => {
+                self.observations.push(obs(label, policy, Origin::Online));
+                Ok(format!("{label} published"))
+            }
+            PolicyState::Missing => {
+                self.observations
+                    .push(obs(label, "not published", Origin::Online));
+                self.findings.push(
+                    Finding::new(
+                        rule,
+                        "email-authentication",
+                        Origin::Online,
+                        Severity::Low,
+                        Confidence::High,
+                        &format!("Email domain does not publish a {label}"),
+                        8,
+                    )
+                    .with_evidence(format!("DNS name={query}; absence weakens spoofing protection but does not prove abuse")),
+                );
+                Ok(format!("{label} not published"))
+            }
+            PolicyState::Multiple(count) => {
+                self.observations.push(obs(
+                    label,
+                    format!("{count} conflicting records"),
+                    Origin::Online,
+                ));
+                self.findings.push(
+                    Finding::new(
+                        rule,
+                        "email-authentication",
+                        Origin::Online,
+                        Severity::Medium,
+                        Confidence::High,
+                        &format!("Email domain publishes multiple {label} records"),
+                        20,
+                    )
+                    .with_evidence(format!("DNS name={query}; matching records={count}")),
+                );
+                Ok(format!("{count} conflicting {label} records"))
+            }
+        }
     }
 }
 

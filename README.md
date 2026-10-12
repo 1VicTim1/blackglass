@@ -1,11 +1,12 @@
 # NULLTRACE
 
-Offline-first forensic terminal for URLs and local files. The interface combines Metasploit-style execution markers, a SOC evidence layout, and a truecolor cyberpunk palette. Counters and events are backed by actual checks.
+Offline-first forensic terminal for URLs, email addresses and local files. The interface combines Metasploit-style execution markers, a SOC evidence layout, and a truecolor cyberpunk palette. Counters and events are backed by actual checks.
 
 ## Run
 
 ```bash
 nulltrace 'https://example.com'
+nulltrace '122aaa121@gmail.com'
 nulltrace ./suspicious-file.jpg
 ```
 
@@ -27,6 +28,8 @@ cargo build --release
 The Android build targets API 24 and runs in current ARM64 Termux installations.
 
 Offline identity checks detect brand lookalikes (including `rnicrosoft`), common Unicode confusables, typos, brand tokens on foreign hosts, and special IP scopes. `data/brands.csv` is a curated, incomplete reference catalog: matching a suffix is attribution, not proof of ownership or safety. Findings include the matched brand, evidence and reference domains.
+
+Email addresses are accepted directly, for example `nulltrace 122aaa121@gmail.com`. Offline checks validate and normalize the address, inspect its local part and reuse domain impersonation rules. After explicit online consent, NULLTRACE queries MX, SPF and DMARC through Cloudflare DNS-over-HTTPS. These records describe the domain and cannot prove that an individual mailbox exists; NULLTRACE does not send mail or perform hidden SMTP recipient probes. Quoted local parts and SMTPUTF8 local parts are intentionally outside the first parser version.
 
 All local files receive filename and active-content inspection: bidirectional/invisible controls, deceptive double extensions, MZ/PE/ELF headers and shebangs. Files are never executed. PE/ELF and executable extensions alone are low-weight signals; filename deception and signature mismatch are stronger signals. Names display control characters as `<U+XXXX>`.
 

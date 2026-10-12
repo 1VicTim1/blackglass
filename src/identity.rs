@@ -7,7 +7,11 @@ pub fn inspect_domain(host: &str) -> (Vec<Finding>, Vec<(String, String)>) {
     let labels: Vec<_> = unicode.split('.').collect();
     let mut findings = Vec::new();
     let mut observations = vec![("Unicode host".into(), unicode.clone())];
-    for line in include_str!("../data/brands.csv").lines().skip(1) {
+    for line in include_str!("../data/brands.csv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .skip(1)
+    {
         let mut fields = line.split(',');
         let (Some(brand), Some(domains), Some(source)) =
             (fields.next(), fields.next(), fields.next())

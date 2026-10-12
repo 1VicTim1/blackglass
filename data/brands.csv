@@ -1,6 +1,7 @@
+# Compiled into NULLTRACE; brand must be lowercase and official suffixes use | separators.
 brand,official_domains,source
-microsoft,microsoft.com|microsoft.ru|live.com|office.com|office365.com|outlook.com|azure.com|windows.com,https://www.microsoft.com/
-google,google.com|google.ru|google.co.uk|google.de|google.fr|google.co.in|google.com.br|google.co.jp|google.com.au|google.ca|google.cn|google.it|google.es|google.co.kr|google.com.hk,https://www.google.com/
+microsoft,microsoft.com|microsoft.ru|live.com|office.com|office365.com|outlook.com|hotmail.com|azure.com|windows.com,https://www.microsoft.com/
+google,google.com|gmail.com|googlemail.com|google.ru|google.co.uk|google.de|google.fr|google.co.in|google.com.br|google.co.jp|google.com.au|google.ca|google.cn|google.it|google.es|google.co.kr|google.com.hk,https://www.google.com/
 apple,apple.com|icloud.com,https://www.apple.com/
 amazon,amazon.com|amazon.co.uk|amazon.de|amazon.fr|amazon.co.jp|amazon.ca|amazon.in|amazon.com.au,https://www.amazon.com/
 paypal,paypal.com|paypal.me,https://www.paypal.com/
