@@ -31,3 +31,12 @@ fn termux_width_uses_compact_layout() {
     assert!(snapshot.contains("TASKS"));
     assert!(!snapshot.contains("FORENSIC OPERATIONS CONSOLE  //  EVIDENCE MATRIX"));
 }
+
+#[test]
+fn desktop_evidence_renders_real_observations() {
+    let mut session = ScanSession::new("https://government.ru/").unwrap();
+    while session.run_next_offline() {}
+    let snapshot = render_snapshot(&session, 120, 38, 0, TerminalCapabilities::enhanced());
+    assert!(snapshot.contains("Government reference"));
+    assert!(snapshot.contains("government.ru"));
+}

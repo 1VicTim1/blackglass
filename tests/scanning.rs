@@ -73,6 +73,12 @@ fn file_scan_hashes_content_and_detects_extension_mismatch() {
 }
 
 #[test]
+fn non_regular_paths_are_rejected_before_scanning() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(ScanSession::new(dir.path().to_str().unwrap()).is_err());
+}
+
+#[test]
 fn ip_classification_distinguishes_scope() {
     assert_eq!(
         nulltrace::analyzers::classify_ip("127.0.0.1".parse::<IpAddr>().unwrap()),
@@ -82,6 +88,20 @@ fn ip_classification_distinguishes_scope() {
         nulltrace::analyzers::classify_ip("8.8.8.8".parse::<IpAddr>().unwrap()),
         "public"
     );
+}
+
+#[test]
+fn bare_ipv4_and_ipv6_targets_are_accepted_and_classified() {
+    for target in ["8.8.8.8", "2001:4860:4860::8888"] {
+        let mut session = ScanSession::new(target).unwrap();
+        while session.run_next_offline() {}
+        assert!(
+            session
+                .observations()
+                .iter()
+                .any(|o| o.label == "Address scope")
+        );
+    }
 }
 
 #[test]
@@ -99,6 +119,16 @@ fn online_requires_authorization_token() {
             .filter(|s| s.online)
             .all(|s| s.status != StepStatus::Locked)
     );
+}
+
+#[test]
+fn cancelling_consent_returns_to_completed_offline_report() {
+    let mut session = ScanSession::new("https://example.com").unwrap();
+    while session.run_next_offline() {}
+    session.request_online_consent().unwrap();
+    session.cancel_online_consent().unwrap();
+    assert_eq!(session.phase(), nulltrace::JobPhase::OfflineComplete);
+    session.request_online_consent().unwrap();
 }
 
 #[test]
@@ -141,6 +171,12 @@ fn unavailable_online_adapters_are_skipped_not_reported_successful() {
         .iter()
         .find(|step| step.id == "http")
         .unwrap();
+    let network = session
+        .steps()
+        .iter()
+        .find(|step| step.id == "network")
+        .unwrap();
+    assert_eq!(network.status, StepStatus::Skipped);
     assert_eq!(tls.status, StepStatus::Skipped);
     assert_eq!(http.status, StepStatus::Skipped);
 }

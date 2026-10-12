@@ -51,11 +51,19 @@ pub struct ScanSession {
 
 impl ScanSession {
     pub fn new(input: &str) -> Result<Self> {
-        let target = if let Ok(url) = Url::parse(input) {
+        let target = if let Ok(ip) = input.parse::<IpAddr>() {
+            let formatted = match ip {
+                IpAddr::V4(v) => format!("https://{v}/"),
+                IpAddr::V6(v) => format!("https://[{v}]/"),
+            };
+            Target::Url(Url::parse(&formatted)?)
+        } else if let Ok(url) = Url::parse(input) {
             Target::Url(url)
         } else {
             let path = PathBuf::from(input);
-            if !path.exists() {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| anyhow!("target is neither a URL nor a readable regular file"))?;
+            if !metadata.file_type().is_file() {
                 return Err(anyhow!("target is neither a URL nor an existing path"));
             }
             Target::File(path)
@@ -160,6 +168,14 @@ impl ScanSession {
         self.consent = true;
         Ok(OnlineToken(()))
     }
+    pub fn cancel_online_consent(&mut self) -> Result<()> {
+        if self.phase != JobPhase::OnlineConsent {
+            return Err(anyhow!("online consent is not active"));
+        }
+        self.phase = JobPhase::OfflineComplete;
+        self.consent = false;
+        Ok(())
+    }
     pub fn begin_online(&mut self) -> Result<()> {
         Err(anyhow!("explicit authorization token required"))
     }
@@ -179,7 +195,7 @@ impl ScanSession {
     fn run_step(&mut self, index: usize) {
         let started = Instant::now();
         let id = self.steps[index].id.clone();
-        let skipped = matches!(id.as_str(), "tls" | "http")
+        let skipped = matches!(id.as_str(), "network" | "tls" | "http")
             || (self.steps[index].online && matches!(&self.target, Target::File(_)));
         let result = match (&self.target, id.as_str()) {
             (Target::Url(url), "parse") => {
@@ -207,7 +223,7 @@ impl ScanSession {
             }
             (Target::Url(url), "ip") => {
                 if let Some(host) = url.host_str()
-                    && let Ok(ip) = host.parse::<IpAddr>()
+                    && let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>()
                 {
                     self.observations
                         .push(obs("Address scope", classify_ip(ip), Origin::Offline));
@@ -231,7 +247,7 @@ impl ScanSession {
                 Ok("Local metadata recorded".into())
             }
             (Target::Url(url), "dns") => self.resolve_dns(url.clone()),
-            (_, "network") => Ok("Local attribution dataset consulted".into()),
+            (_, "network") => Ok("No sourced ASN / country prefix dataset available".into()),
             (Target::Url(_), "tls") => {
                 Ok("TLS adapter reserved; no unsupported claim emitted".into())
             }
@@ -275,7 +291,8 @@ impl ScanSession {
                 .with_evidence(url.username()),
             );
         }
-        if let Some(host) = url.host_str() {
+        if let Some(raw_host) = url.host_str() {
+            let host = raw_host.trim_matches(['[', ']']);
             self.observations.push(obs("Host", host, Origin::Offline));
             if let Some(reference) = crate::data::lookup_government_host(host) {
                 self.observations.push(obs(
@@ -316,7 +333,8 @@ impl ScanSession {
         Ok("Host identity inspected".into())
     }
     fn resolve_dns(&mut self, url: Url) -> Result<String> {
-        let host = url.host_str().context("URL has no host")?;
+        let raw_host = url.host_str().context("URL has no host")?;
+        let host = raw_host.trim_matches(['[', ']']);
         let port = url.port_or_known_default().unwrap_or(443);
         let addresses: Vec<_> = (host, port).to_socket_addrs()?.map(|a| a.ip()).collect();
         for ip in &addresses {
@@ -396,7 +414,12 @@ fn fs_signature(
     if let Some((mime, ext)) = detected {
         observations.push(obs("Detected MIME", mime, Origin::Offline));
         let actual = path.extension().and_then(|v| v.to_str()).unwrap_or("");
-        if !actual.eq_ignore_ascii_case(ext) {
+        let compatible = actual.eq_ignore_ascii_case(ext)
+            || matches!(
+                (actual.to_ascii_lowercase().as_str(), ext),
+                ("jpeg", "jpg") | ("dll" | "scr", "exe")
+            );
+        if !compatible {
             findings.push(
                 Finding::new(
                     "FILE-EXTENSION",

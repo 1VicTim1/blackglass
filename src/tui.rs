@@ -203,7 +203,12 @@ fn draw_compact(
     tick: usize,
     c: TerminalCapabilities,
 ) {
-    draw_tree(frame, area, s, tick, c);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+    draw_tree(frame, rows[0], s, tick, c);
+    draw_evidence(frame, rows[1], s, c);
 }
 fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: TerminalCapabilities) {
     let mut items = vec![ListItem::new(Line::styled(
@@ -215,8 +220,14 @@ fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: Ter
     for step in s.steps().iter().filter(|v| !v.online) {
         items.push(step_item(step, tick, c));
     }
+    let online_title =
+        if s.phase() == crate::JobPhase::OnlineRunning || s.phase() == crate::JobPhase::Complete {
+            "▶ ONLINE INTELLIGENCE"
+        } else {
+            "▶ ONLINE INTELLIGENCE [LOCKED]"
+        };
     items.push(ListItem::new(Line::styled(
-        "▶ ONLINE INTELLIGENCE [LOCKED]",
+        online_title,
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -306,6 +317,18 @@ fn draw_evidence(frame: &mut Frame, area: Rect, s: &ScanSession, c: TerminalCapa
                 format!("    └─ {ev}"),
                 Style::default().fg(Color::DarkGray),
             ));
+        }
+    }
+    if !s.observations().is_empty() {
+        lines.push(Line::styled(
+            "── RAW OBSERVATIONS",
+            Style::default().fg(Color::Cyan),
+        ));
+        for observation in s.observations() {
+            lines.push(Line::from(vec![
+                Span::styled("[+] ", Style::default().fg(Color::Green)),
+                Span::raw(format!("{}: {}", observation.label, observation.value)),
+            ]));
         }
     }
     frame.render_widget(
@@ -414,16 +437,22 @@ fn risk_color(score: u8, c: TerminalCapabilities) -> Color {
     }
 }
 
+struct TerminalRestore;
+impl Drop for TerminalRestore {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
 pub fn run(mut session: ScanSession) -> Result<ScanSession> {
     enable_raw_mode()?;
+    let _restore = TerminalRestore;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, &mut session);
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
     result?;
     Ok(session)
 }
@@ -461,6 +490,7 @@ where
                     consent = true;
                 }
                 KeyCode::Esc if consent => {
+                    session.cancel_online_consent()?;
                     consent = false;
                 }
                 _ => {}
