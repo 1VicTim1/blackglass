@@ -57,5 +57,21 @@ fn evidence_panel_can_scroll_through_dense_real_data() {
     let top = render_snapshot_scrolled(&session, 80, 24, 0, TerminalCapabilities::basic(), 0);
     let lower = render_snapshot_scrolled(&session, 80, 24, 0, TerminalCapabilities::basic(), 6);
     assert_ne!(top, lower);
-    assert!(lower.contains("Host labels") || lower.contains("Explicit port"));
+    assert!((1..30).any(|offset| {
+        render_snapshot_scrolled(&session, 80, 24, 0, TerminalCapabilities::basic(), offset)
+            .contains("Host labels")
+    }));
+}
+
+#[test]
+fn zero_is_neutral_and_local_report_has_no_dns_or_network_prompt() {
+    let f = tempfile::NamedTempFile::new().unwrap();
+    let mut s = ScanSession::new(f.path().to_str().unwrap()).unwrap();
+    while s.run_next_offline() {}
+    let snap = render_snapshot(&s, 120, 50, 0, TerminalCapabilities::enhanced());
+    assert!(snap.contains("zero does not establish safety"));
+    assert!(snap.contains("Coverage:"));
+    assert!(snap.contains("LOCAL REPORT READY"));
+    assert!(!snap.contains("Resolve DNS"));
+    assert!(!snap.contains("ONLINE INTELLIGENCE"));
 }

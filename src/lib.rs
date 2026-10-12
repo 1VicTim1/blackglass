@@ -8,3 +8,7 @@ pub mod scan;
 pub mod tui;
 
 pub use model::{CheckState, Confidence, Finding, JobPhase, Observation, Origin, Severity};
+
+pub mod identity;
+
+pub mod files;

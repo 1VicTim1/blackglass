@@ -169,7 +169,7 @@ fn draw_scrolled(
         gradient_line("N U L L T R A C E", caps),
         Line::from(vec![
             Span::styled("[*] ", Style::default().fg(Color::Green)),
-            Span::raw(session.target()),
+            Span::raw(crate::files::visible(session.target())),
         ]),
         Line::from("OFFLINE FIRST  •  ONLINE BY CONSENT  •  ZERO FABRICATED INTEL"),
     ])
@@ -186,7 +186,12 @@ fn draw_scrolled(
         draw_compact(frame, rows[1], session, tick, caps, evidence_scroll)
     }
     let complete = session.offline_complete();
-    let footer = if complete && session.phase() == crate::JobPhase::OfflineComplete {
+    let footer = if complete
+        && session.phase() == crate::JobPhase::OfflineComplete
+        && !session.has_online_checks()
+    {
+        " LOCAL REPORT READY  •  [↑↓] evidence  •  [q] quit "
+    } else if complete && session.phase() == crate::JobPhase::OfflineComplete {
         " OFFLINE REPORT READY  ──  Press ENTER for online enrichment  •  [q] quit "
     } else {
         " [q] quit  •  [↑↓] navigate  •  evidence is state-backed "
@@ -259,16 +264,18 @@ fn draw_tree(frame: &mut Frame, area: Rect, s: &ScanSession, tick: usize, c: Ter
         } else {
             "▶ ONLINE INTELLIGENCE [LOCKED]"
         };
-    items.push(ListItem::new(Line::styled(
-        online_title,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )));
-    for step in s.steps().iter().filter(|v| v.online) {
-        items.push(step_item(step, tick, c));
-        if !step.detail.is_empty() {
-            items.push(step_detail_item(step));
+    if s.has_online_checks() {
+        items.push(ListItem::new(Line::styled(
+            online_title,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for step in s.steps().iter().filter(|v| v.online) {
+            items.push(step_item(step, tick, c));
+            if !step.detail.is_empty() {
+                items.push(step_detail_item(step));
+            }
         }
     }
     let settled = s
@@ -336,7 +343,11 @@ fn draw_evidence(
             Span::styled(
                 format!(" RISK {:02}/100 ", summary.score),
                 Style::default()
-                    .bg(risk_color(summary.score, c))
+                    .bg(if summary.score == 0 {
+                        Color::DarkGray
+                    } else {
+                        risk_color(summary.score, c)
+                    })
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             ),
@@ -344,9 +355,30 @@ fn draw_evidence(
         ]),
         Line::raw(""),
     ];
+    let checked = s
+        .steps()
+        .iter()
+        .filter(|v| v.status == StepStatus::Completed)
+        .count();
+    let missing = s
+        .steps()
+        .iter()
+        .filter(|v| matches!(v.status, StepStatus::Skipped | StepStatus::Failed))
+        .count();
+    lines.push(Line::styled(
+        format!(
+            "Coverage: {checked}/{} checked; {missing} unavailable",
+            s.steps().len()
+        ),
+        Style::default().fg(Color::Yellow),
+    ));
+    lines.push(Line::styled(
+        "Heuristic score; zero does not establish safety",
+        Style::default().fg(Color::DarkGray),
+    ));
     if s.findings().is_empty() {
         lines.push(Line::styled(
-            "[?] No findings yet",
+            "[?] No heuristic indicators detected",
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -358,14 +390,14 @@ fn draw_evidence(
         };
         lines.push(Line::from(vec![
             Span::styled(m, Style::default().fg(Color::Yellow)),
-            Span::raw(format!(
+            Span::raw(crate::files::visible(&format!(
                 " {} [{:?}/{:?} +{}]  {}",
                 f.rule_id, f.severity, f.confidence, f.weight, f.summary
-            )),
+            ))),
         ]));
         for ev in &f.evidence {
             lines.push(Line::styled(
-                format!("    └─ {ev}"),
+                crate::files::visible(&format!("    └─ {ev}")),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -378,21 +410,27 @@ fn draw_evidence(
         for observation in s.observations() {
             lines.push(Line::from(vec![
                 Span::styled("[+] ", Style::default().fg(Color::Green)),
-                Span::raw(format!("{}: {}", observation.label, observation.value)),
+                Span::raw(crate::files::visible(&format!(
+                    "{}: {}",
+                    observation.label, observation.value
+                ))),
             ]));
         }
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" EVIDENCE TREE ")
+        .border_style(Style::default().fg(rgb(c, 255, 0, 170, Color::Magenta)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let regions = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(inner);
+    let body = lines.split_off(4);
+    frame.render_widget(Paragraph::new(lines), regions[0]);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(body)
             .scroll((scroll, 0))
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" EVIDENCE TREE ")
-                    .border_style(Style::default().fg(rgb(c, 255, 0, 170, Color::Magenta))),
-            ),
-        area,
+            .wrap(Wrap { trim: true }),
+        regions[1],
     );
 }
 fn draw_events(frame: &mut Frame, area: Rect, s: &ScanSession, _c: TerminalCapabilities) {
@@ -402,7 +440,7 @@ fn draw_events(frame: &mut Frame, area: Rect, s: &ScanSession, _c: TerminalCapab
         .rev()
         .take(area.height.saturating_sub(2) as usize)
         .rev()
-        .map(|v| Line::raw(v.clone()))
+        .map(|v| Line::raw(crate::files::visible(v)))
         .collect();
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -516,19 +554,35 @@ where
 {
     let caps = TerminalCapabilities::detect();
     let started = Instant::now();
-    let mut last = Instant::now();
+    let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+    let mut working = false;
     let mut consent = false;
     let mut evidence_scroll = 0u16;
     loop {
         let tick = (started.elapsed().as_millis() / 140) as usize;
         terminal.draw(|f| draw_scrolled(f, session, tick, caps, consent, evidence_scroll))?;
-        if last.elapsed() >= Duration::from_millis(420) {
-            if session.phase() == crate::JobPhase::OfflineRunning {
-                session.run_next_offline();
-            } else if session.phase() == crate::JobPhase::OnlineRunning {
-                session.run_next_online();
-            }
-            last = Instant::now();
+        if let Ok(updated) = worker_rx.try_recv() {
+            *session = updated;
+            working = false;
+        }
+        if !working
+            && matches!(
+                session.phase(),
+                crate::JobPhase::OfflineRunning | crate::JobPhase::OnlineRunning
+            )
+        {
+            // Publish Running before the expensive part runs on the next worker turn.
+            let mut owned = session.clone();
+            let tx = worker_tx.clone();
+            working = true;
+            std::thread::spawn(move || {
+                if owned.phase() == crate::JobPhase::OfflineRunning {
+                    owned.run_next_offline();
+                } else {
+                    owned.run_next_online();
+                }
+                let _ = tx.send(owned);
+            });
         }
         if event::poll(Duration::from_millis(60))?
             && let Event::Key(key) = event::read()?
@@ -540,7 +594,10 @@ where
                     session.begin_online_with(token)?;
                     consent = false;
                 }
-                KeyCode::Enter if session.phase() == crate::JobPhase::OfflineComplete => {
+                KeyCode::Enter
+                    if session.phase() == crate::JobPhase::OfflineComplete
+                        && session.has_online_checks() =>
+                {
                     session.request_online_consent()?;
                     consent = true;
                 }
@@ -548,6 +605,9 @@ where
                     session.cancel_online_consent()?;
                     consent = false;
                 }
+                KeyCode::Home => evidence_scroll = 0,
+                KeyCode::PageUp => evidence_scroll = evidence_scroll.saturating_sub(8),
+                KeyCode::PageDown => evidence_scroll = evidence_scroll.saturating_add(8),
                 KeyCode::Up => evidence_scroll = evidence_scroll.saturating_sub(1),
                 KeyCode::Down => evidence_scroll = evidence_scroll.saturating_add(1),
                 _ => {}

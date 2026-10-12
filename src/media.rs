@@ -33,7 +33,8 @@ pub fn inspect_image(path: &Path) -> Result<Vec<(String, String)>> {
                 exif::Tag::Make => Some("EXIF Make"),
                 exif::Tag::Model => Some("EXIF Model"),
                 exif::Tag::Software => Some("EXIF Software"),
-                exif::Tag::DateTime | exif::Tag::DateTimeOriginal => Some("EXIF Date/Time"),
+                exif::Tag::DateTime => Some("EXIF Date/Time"),
+                exif::Tag::DateTimeOriginal => Some("EXIF Original date/time"),
                 exif::Tag::GPSLatitude => Some("EXIF GPS latitude"),
                 exif::Tag::GPSLongitude => Some("EXIF GPS longitude"),
                 _ => None,
@@ -41,7 +42,20 @@ pub fn inspect_image(path: &Path) -> Result<Vec<(String, String)>> {
             if let Some(label) = label {
                 observations.push((
                     label.into(),
-                    field.display_value().with_unit(&exif).to_string(),
+                    match &field.value {
+                        exif::Value::Ascii(values) => values
+                            .iter()
+                            .map(|v| {
+                                String::from_utf8_lossy(v)
+                                    .trim_matches(char::from(0))
+                                    .trim()
+                                    .to_string()
+                            })
+                            .filter(|v| !v.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        _ => field.display_value().with_unit(&exif).to_string(),
+                    },
                 ));
             }
         }
@@ -144,7 +158,9 @@ pub fn probe_video(path: &Path, timeout: Duration) -> Result<ProbeResult> {
             "-show_format",
             "-show_streams",
         ])
-        .arg(path)
+        .arg("-i")
+        .arg(path.canonicalize()?)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -158,6 +174,10 @@ pub fn probe_video(path: &Path, timeout: Duration) -> Result<ProbeResult> {
         }
         Err(e) => return Err(e.into()),
     };
+    let stdout = child.stdout.take().context("ffprobe stdout missing")?;
+    let stderr = child.stderr.take().context("ffprobe stderr missing")?;
+    let stdout_reader = thread::spawn(move || read_probe_output(stdout));
+    let stderr_reader = thread::spawn(move || read_probe_output(stderr));
     let start = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
@@ -166,19 +186,48 @@ pub fn probe_video(path: &Path, timeout: Duration) -> Result<ProbeResult> {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(anyhow!("ffprobe timed out after {}s", timeout.as_secs()));
         }
         thread::sleep(Duration::from_millis(25));
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    let status = child.wait()?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("ffprobe output reader failed"))??;
+    let _stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("ffprobe error reader failed"))??;
+    if !status.success() {
         return Err(anyhow!("ffprobe rejected the media file"));
     }
-    let observations = parse_ffprobe_json(&output.stdout)?;
+    let observations = parse_ffprobe_json(&stdout)?;
     Ok(ProbeResult {
         observations,
         skipped: None,
     })
+}
+
+fn read_probe_output(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut over_limit = false;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n <= 4 * 1024 * 1024 {
+            out.extend_from_slice(&buf[..n]);
+        } else {
+            over_limit = true;
+        }
+    }
+    if over_limit {
+        return Err(anyhow!("ffprobe output exceeds 4 MiB limit"));
+    }
+    Ok(out)
 }
 
 pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<Vec<(String, String)>> {
@@ -228,4 +277,175 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<Vec<(String, String)>> {
         }
     }
     Ok(observations)
+}
+
+/// Bounded ISO BMFF parsing; media payload is skipped with seek, never loaded.
+pub fn inspect_mp4(path: &Path) -> Result<Vec<(String, String)>> {
+    let mut f = File::open(path)?;
+    let size = f.metadata()?.len();
+    let mut out = vec![(
+        "Container parser".into(),
+        "built-in ISO BMFF; no external helper".into(),
+    )];
+    let mut budget = 10000usize;
+    parse_boxes(&mut f, 0, size, 0, &mut budget, &mut out)?;
+    if !out.iter().any(|(k, _)| k == "Major brand") {
+        return Err(anyhow!("not an ISO BMFF container with ftyp"));
+    }
+    out.push((
+        "Forensic limits".into(),
+        "Container metadata cannot prove cropping or re-encoding without a reference original"
+            .into(),
+    ));
+    Ok(out)
+}
+fn parse_boxes(
+    f: &mut File,
+    mut pos: u64,
+    end: u64,
+    depth: usize,
+    budget: &mut usize,
+    out: &mut Vec<(String, String)>,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    if depth > 12 {
+        return Err(anyhow!("MP4 nesting exceeds limit"));
+    }
+    while pos < end {
+        if *budget == 0 {
+            return Err(anyhow!("MP4 box count exceeds limit"));
+        }
+        *budget -= 1;
+        if end - pos < 8 {
+            return Err(anyhow!("truncated MP4 box header"));
+        }
+        f.seek(SeekFrom::Start(pos))?;
+        let mut header = [0u8; 8];
+        f.read_exact(&mut header)?;
+        let mut size = u32::from_be_bytes(header[..4].try_into()?) as u64;
+        let kind: [u8; 4] = header[4..].try_into()?;
+        let mut header_len = 8u64;
+        if size == 1 {
+            let mut n = [0u8; 8];
+            f.read_exact(&mut n)?;
+            size = u64::from_be_bytes(n);
+            header_len = 16;
+        } else if size == 0 {
+            size = end - pos;
+        }
+        if size < header_len || size > end - pos {
+            return Err(anyhow!("MP4 box extends beyond container boundary"));
+        }
+        let start = pos + header_len;
+        let next = pos + size;
+        if depth == 0 {
+            out.push((
+                "Container box".into(),
+                format!(
+                    "{} offset={pos} size={size}",
+                    String::from_utf8_lossy(&kind)
+                ),
+            ));
+        }
+        if matches!(
+            &kind,
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"udta"
+        ) {
+            parse_boxes(f, start, next, depth + 1, budget, out)?;
+        } else {
+            let len = ((size - header_len).min(256)) as usize;
+            let mut data = vec![0u8; len];
+            f.seek(SeekFrom::Start(start))?;
+            f.read_exact(&mut data)?;
+            match &kind {
+                b"ftyp" if data.len() >= 8 => {
+                    out.push((
+                        "Major brand".into(),
+                        String::from_utf8_lossy(&data[..4]).into_owned(),
+                    ));
+                    out.push((
+                        "Compatible brands".into(),
+                        data[8..]
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|s| String::from_utf8_lossy(s))
+                            .collect::<Vec<_>>()
+                            .join(" / "),
+                    ));
+                }
+                b"mvhd" | b"mdhd" if !data.is_empty() => {
+                    let offsets = match data[0] {
+                        0 => Some((12usize, 16usize, 4usize)),
+                        1 => Some((20, 24, 8)),
+                        _ => None,
+                    };
+                    if let Some((scale_offset, duration_offset, width)) = offsets
+                        && data.len() >= duration_offset + width
+                    {
+                        let scale =
+                            u32::from_be_bytes(data[scale_offset..scale_offset + 4].try_into()?);
+                        let duration = if width == 4 {
+                            u32::from_be_bytes(
+                                data[duration_offset..duration_offset + 4].try_into()?,
+                            ) as u64
+                        } else {
+                            u64::from_be_bytes(
+                                data[duration_offset..duration_offset + 8].try_into()?,
+                            )
+                        };
+                        if scale > 0
+                            && duration != u64::MAX
+                            && !(width == 4 && duration == u32::MAX as u64)
+                        {
+                            out.push((
+                                if kind == *b"mvhd" {
+                                    "Duration"
+                                } else {
+                                    "Track duration"
+                                }
+                                .into(),
+                                format!("{:.3}s", duration as f64 / scale as f64),
+                            ));
+                        }
+                        out.push(("Time scale".into(), format!("{scale} ticks/s")));
+                    }
+                }
+                b"tkhd" if !data.is_empty() => {
+                    let offset = match data[0] {
+                        0 => Some(76),
+                        1 => Some(88),
+                        _ => None,
+                    };
+                    if let Some(offset) = offset
+                        && data.len() >= offset + 8
+                    {
+                        let w = u32::from_be_bytes(data[offset..offset + 4].try_into()?) >> 16;
+                        let h = u32::from_be_bytes(data[offset + 4..offset + 8].try_into()?) >> 16;
+                        if w > 0 && h > 0 {
+                            out.push(("Track dimensions".into(), format!("{w}×{h}")));
+                        }
+                    }
+                }
+                b"hdlr" if data.len() >= 12 => out.push((
+                    "Track handler".into(),
+                    String::from_utf8_lossy(&data[8..12]).into_owned(),
+                )),
+                b"stsd" if data.len() >= 16 => out.push((
+                    "Sample codec".into(),
+                    String::from_utf8_lossy(&data[12..16]).into_owned(),
+                )),
+                b"elst" if data.len() >= 8 => out.push((
+                    "Edit list".into(),
+                    format!(
+                        "{} entries; may represent timing offsets, not proof of trimming",
+                        u32::from_be_bytes(data[4..8].try_into()?)
+                    ),
+                )),
+                _ => {}
+            }
+        }
+        pos = next;
+    }
+    Ok(())
 }

@@ -31,12 +31,14 @@ pub struct ScanStep {
     pub elapsed_ms: u128,
 }
 
+#[derive(Clone)]
 enum Target {
     Url(Url),
     File(PathBuf),
 }
 pub struct OnlineToken(());
 
+#[derive(Clone)]
 pub struct ScanSession {
     target_text: String,
     target: Target,
@@ -58,6 +60,9 @@ impl ScanSession {
             };
             Target::Url(Url::parse(&formatted)?)
         } else if let Ok(url) = Url::parse(input) {
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(anyhow!("only HTTP(S) URLs with a host are supported"));
+            }
             Target::Url(url)
         } else {
             let path = PathBuf::from(input);
@@ -80,6 +85,7 @@ impl ScanSession {
                 offline("hash", "Calculate SHA-256"),
                 offline("signature", "Detect content signature"),
                 offline("metadata", "Inspect local metadata"),
+                offline("file_safety", "Inspect filename / executable headers"),
             ],
         };
         if let Target::File(path) = &target {
@@ -88,7 +94,15 @@ impl ScanSession {
                 .and_then(|v| v.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp") {
+            let mut signature = [0u8; 8192];
+            let mime = File::open(path)
+                .ok()
+                .and_then(|mut f| f.read(&mut signature).ok())
+                .and_then(|n| infer::get(&signature[..n]))
+                .map(|k| k.mime_type());
+            if matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp")
+                || matches!(mime, Some("image/jpeg" | "image/png" | "image/webp"))
+            {
                 steps.push(offline(
                     "image_structure",
                     "Inspect image structure / encoding",
@@ -97,16 +111,26 @@ impl ScanSession {
             if matches!(
                 extension.as_str(),
                 "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "ts"
+            ) || matches!(
+                mime,
+                Some("video/mp4" | "video/quicktime" | "video/webm" | "video/x-matroska")
             ) {
+                if matches!(extension.as_str(), "mp4" | "mov" | "m4v")
+                    || matches!(mime, Some("video/mp4" | "video/quicktime"))
+                {
+                    steps.push(offline("video_container", "Inspect built-in MP4 container"));
+                }
                 steps.push(offline("video_probe", "Probe video container / streams"));
             }
         }
-        steps.extend([
-            online("dns", "Resolve DNS records"),
-            online("network", "Attribute IP / ASN / country"),
-            online("tls", "Inspect TLS identity"),
-            online("http", "Trace HTTP redirects"),
-        ]);
+        if matches!(&target, Target::Url(_)) {
+            steps.extend([
+                online("dns", "Resolve DNS records"),
+                online("network", "Attribute IP / ASN / country"),
+                online("tls", "Inspect TLS identity"),
+                online("http", "Trace HTTP redirects"),
+            ]);
+        }
         Ok(Self {
             target_text: input.into(),
             target,
@@ -173,7 +197,13 @@ impl ScanSession {
         self.active_step = Some(index);
         true
     }
+    pub fn has_online_checks(&self) -> bool {
+        self.steps.iter().any(|s| s.online)
+    }
     pub fn request_online_consent(&mut self) -> Result<()> {
+        if !self.has_online_checks() {
+            return Err(anyhow!("no online checks applicable to this target"));
+        }
         if self.phase != JobPhase::OfflineComplete {
             return Err(anyhow!("offline scan is not complete"));
         }
@@ -269,6 +299,13 @@ impl ScanSession {
                 {
                     self.observations
                         .push(obs("Address scope", classify_ip(ip), Origin::Offline));
+                    self.findings
+                        .extend(crate::analyzers::ip_findings(ip, Origin::Offline));
+                    self.observations.push(obs(
+                        "IP family",
+                        if ip.is_ipv4() { "IPv4" } else { "IPv6" },
+                        Origin::Offline,
+                    ));
                 }
                 Ok("Address scope classified".into())
             }
@@ -288,8 +325,30 @@ impl ScanSession {
                 ));
                 Ok("Local metadata recorded".into())
             }
+            (Target::File(path), "file_safety") => {
+                let result = crate::files::inspect(path);
+                result.map(|(findings, details)| {
+                    self.findings.extend(findings);
+                    self.observations.extend(
+                        details
+                            .into_iter()
+                            .map(|(k, v)| obs(&k, v, Origin::Offline)),
+                    );
+                    "Filename and active-content inspection complete".into()
+                })
+            }
             (Target::File(path), "image_structure") => {
-                inspect_image_step(path, &mut self.observations)
+                inspect_image_step(path, &mut self.observations, &mut self.findings)
+            }
+            (Target::File(path), "video_container") => {
+                crate::media::inspect_mp4(path).map(|details| {
+                    self.observations.extend(
+                        details
+                            .into_iter()
+                            .map(|(k, v)| obs(&k, v, Origin::Offline)),
+                    );
+                    "Built-in container analysis complete".into()
+                })
             }
             (Target::File(path), "video_probe") => probe_video_step(path, &mut self.observations),
             (Target::Url(url), "dns") => self.resolve_dns(url.clone()),
@@ -373,6 +432,15 @@ impl ScanSession {
         if let Some(raw_host) = url.host_str() {
             let host = raw_host.trim_matches(['[', ']']);
             self.observations.push(obs("Host", host, Origin::Offline));
+            if host.parse::<IpAddr>().is_err() {
+                let (findings, details) = crate::identity::inspect_domain(host);
+                self.findings.extend(findings);
+                self.observations.extend(
+                    details
+                        .into_iter()
+                        .map(|(k, v)| obs(&k, v, Origin::Offline)),
+                );
+            }
             if let Some(reference) = crate::data::lookup_government_host(host) {
                 self.observations.push(obs(
                     "Government reference",
@@ -429,6 +497,23 @@ impl ScanSession {
                 );
             }
             if host.parse::<IpAddr>().is_ok() {
+                if !self.target_text.contains(host) {
+                    self.findings.push(
+                        Finding::new(
+                            "URL-IP-OBFUSCATED",
+                            "address-scope",
+                            Origin::Offline,
+                            Severity::High,
+                            Confidence::High,
+                            "IP address used a non-canonical representation",
+                            35,
+                        )
+                        .with_evidence(format!(
+                            "normalized IP={host}; input={}",
+                            crate::files::visible(&self.target_text)
+                        )),
+                    );
+                }
                 self.findings.push(
                     Finding::new(
                         "URL-IP-HOST",
@@ -479,8 +564,22 @@ impl ScanSession {
         let raw_host = url.host_str().context("URL has no host")?;
         let host = raw_host.trim_matches(['[', ']']);
         let port = url.port_or_known_default().unwrap_or(443);
-        let addresses: Vec<_> = (host, port).to_socket_addrs()?.map(|a| a.ip()).collect();
+        let host = host.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let resolved = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|items| items.map(|a| a.ip()).collect::<Vec<_>>());
+            let _ = tx.send(resolved);
+        });
+        let mut addresses = rx
+            .recv_timeout(NETWORK_TIMEOUT)
+            .context("DNS resolution timed out")??;
+        addresses.sort();
+        addresses.dedup();
         for ip in &addresses {
+            self.findings
+                .extend(crate::analyzers::ip_findings(*ip, Origin::Online));
             self.observations.push(obs(
                 "Resolved address",
                 format!("{ip} ({})", classify_ip(*ip)),
@@ -510,7 +609,7 @@ fn step(id: &str, label: &str, status: StepStatus, online: bool) -> ScanStep {
 fn obs(label: &str, value: impl Into<String>, origin: Origin) -> Observation {
     Observation {
         label: label.into(),
-        value: value.into(),
+        value: crate::files::visible(&value.into()),
         origin,
     }
 }
@@ -612,8 +711,28 @@ fn fs_signature(
     Ok("Content signature inspected".into())
 }
 
-fn inspect_image_step(path: &Path, observations: &mut Vec<Observation>) -> Result<String> {
+fn inspect_image_step(
+    path: &Path,
+    observations: &mut Vec<Observation>,
+    findings: &mut Vec<Finding>,
+) -> Result<String> {
     for (label, value) in crate::media::inspect_image(path)? {
+        if label == "EXIF Software"
+            && [
+                "photoshop",
+                "gimp",
+                "lightroom",
+                "snapseed",
+                "paint.net",
+                "affinity",
+                "pixelmator",
+            ]
+            .iter()
+            .any(|editor| value.to_lowercase().contains(editor))
+        {
+            findings.push(Finding::new("IMAGE-EDITOR-METADATA", "media-provenance", Origin::Offline, Severity::Low, Confidence::Low, "Metadata names image editing software", 15)
+                .with_evidence(format!("Software={value}; metadata may be forged; this does not prove manipulation or cropping")));
+        }
         observations.push(obs(&label, value, Origin::Offline));
     }
     Ok("Image structure inspected".into())
@@ -625,10 +744,12 @@ fn probe_video_step(path: &Path, observations: &mut Vec<Observation>) -> Result<
         observations.push(obs(&label, value, Origin::Offline));
     }
     Ok(match probe.skipped {
-        Some(reason) => format!("SKIPPED: {reason}"),
+        Some(reason) => {
+            observations.push(obs("Probe limitation", "ffprobe unavailable: install with pkg install ffmpeg in Termux; built-in MP4 analysis remains available", Origin::Offline));
+            format!("SKIPPED: {reason}; Termux: pkg install ffmpeg")
+        }
         None => "Video streams inspected".into(),
     })
 }
 
-#[allow(dead_code)]
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(8);

@@ -25,3 +25,9 @@ cargo build --release
 ```
 
 The Android build targets API 24 and runs in current ARM64 Termux installations.
+
+Offline identity checks detect brand lookalikes (including `rnicrosoft`), common Unicode confusables, typos, brand tokens on foreign hosts, and special IP scopes. `data/brands.csv` is a curated, incomplete reference catalog: matching a suffix is attribution, not proof of ownership or safety. Findings include the matched brand, evidence and reference domains.
+
+All local files receive filename and active-content inspection: bidirectional/invisible controls, deceptive double extensions, MZ/PE/ELF headers and shebangs. Files are never executed. PE/ELF and executable extensions alone are low-weight signals; filename deception and signature mismatch are stronger signals. Names display control characters as `<U+XXXX>`.
+
+MP4/MOV/M4V containers have a bounded built-in ISO BMFF parser for brands, box offsets/sizes, duration, track dimensions, sample codecs and edit lists. This works without ffprobe; optional ffprobe adds stream detail (`pkg install ffmpeg` in Termux). Cropping and re-encoding cannot be established from container metadata alone. Local reports have no DNS tasks or network consent prompt. A zero heuristic score does not establish safety; coverage and unavailable checks appear in the report.

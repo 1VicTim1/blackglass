@@ -123,3 +123,34 @@ fn ffprobe_json_exposes_container_codec_dimensions_and_rate() {
             .any(|(k, v)| k == "Encoder" && v == "Lavf61")
     );
 }
+#[test]
+fn builtin_mp4_inspects_without_external_helpers_and_rejects_truncated_boxes() {
+    fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut b = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend(kind);
+        b.extend(payload);
+        b
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("clip.mp4");
+    let mut b = atom(b"ftyp", b"isom\0\0\0\0isom");
+    let mut mvhd = vec![0u8; 20];
+    mvhd[12..16].copy_from_slice(&1000u32.to_be_bytes());
+    mvhd[16..20].copy_from_slice(&2500u32.to_be_bytes());
+    let mut tkhd = vec![0u8; 84];
+    tkhd[76..80].copy_from_slice(&(1920u32 << 16).to_be_bytes());
+    tkhd[80..84].copy_from_slice(&(1080u32 << 16).to_be_bytes());
+    let mut moov = atom(b"mvhd", &mvhd);
+    moov.extend(atom(b"trak", &atom(b"tkhd", &tkhd)));
+    b.extend(atom(b"moov", &moov));
+    b.extend(atom(b"mdat", b"sample"));
+    std::fs::write(&p, b).unwrap();
+    let o = nulltrace::media::inspect_mp4(&p).unwrap();
+    assert!(o.iter().any(|(k, v)| k == "Duration" && v == "2.500s"));
+    assert!(
+        o.iter()
+            .any(|(k, v)| k == "Track dimensions" && v == "1920×1080")
+    );
+    std::fs::write(&p, b"\0\0\x10\0ftypisom").unwrap();
+    assert!(nulltrace::media::inspect_mp4(&p).is_err());
+}
